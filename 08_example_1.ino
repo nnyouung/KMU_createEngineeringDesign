@@ -1,78 +1,221 @@
+#include <Servo.h>
+
 // Arduino pin assignment
 #define PIN_LED 9
-#define PIN_TRIG 12   // sonar sensor TRIGGER
-#define PIN_ECHO 13   // sonar sensor ECHO
+#define PIN_SERVO 10
+#define PIN_TRIG 12
+#define PIN_ECHO 13
 
 // configurable parameters
-#define SND_VEL 346.0     // sound velocity at 24 celsius degree (unit: m/sec)
-#define INTERVAL 25      // sampling interval (unit: msec)
-#define PULSE_DURATION 10 // ultra-sound Pulse Duration (unit: usec)
-#define _DIST_MIN 100.0   // minimum distance to be measured (unit: mm)
-#define _DIST_MAX 300.0   // maximum distance to be measured (unit: mm)
+#define SND_VEL 346.0 // sound velocity at 24 celsius degree (unit: m/s)
+#define INTERVAL 25 // sampling interval (unit: ms)
+#define _DIST_MIN 100 // minimum distance to be measured (unit: mm)
+#define _DIST_MAX 400 // maximum distance to be measured (unit: mm)
+#define _DIST_ALPHA 0.3 // EMA weight of new sample (range: 0 to 1). Setting this value to 1 effectively disables EMA filter.
+#define _DUTY_MIN 553 // servo full clockwise position (0 degree)
+#define _DUTY_NEU 1476 // servo neutral position (90 degree)
+#define _DUTY_MAX 2399 // servo full counterclockwise position (180 degree)
 
-#define TIMEOUT ((INTERVAL / 2) * 1000.0) // maximum echo waiting time (unit: usec)
-#define SCALE (0.001 * 0.5 * SND_VEL) // coefficent to convert duration to distance
-
-unsigned long last_sampling_time;   // unit: msec
+// global variables
+float timeout; // unit: us
+float dist_min, dist_max, dist_raw, dist_prev, dist_ema, alpha; // unit: mm
+unsigned long last_sampling_time; // unit: ms
+float scale; // used for pulse duration to distance conversion
+Servo myservo;
 
 void setup() {
-  // initialize GPIO pins
-  pinMode(PIN_LED, OUTPUT);
-  pinMode(PIN_TRIG, OUTPUT);  // sonar TRIGGER
-  pinMode(PIN_ECHO, INPUT);   // sonar ECHO
-  digitalWrite(PIN_TRIG, LOW);  // turn-off Sonar 
-  
-  // initialize serial port
-  Serial.begin(57600);
+// initialize GPIO pins
+  pinMode(PIN_LED,OUTPUT);
+  pinMode(PIN_TRIG,OUTPUT);
+  digitalWrite(PIN_TRIG, LOW); 
+  pinMode(PIN_ECHO,INPUT);
+
+  myservo.attach(PIN_SERVO); 
+  myservo.writeMicroseconds(_DUTY_NEU);
+
+// initialize USS related variables
+  dist_min = _DIST_MIN; 
+  dist_max = _DIST_MAX;
+  alpha = _DIST_ALPHA;
+  timeout = (INTERVAL / 2) * 1000.0; // precalculate pulseIn() timeout value. (unit: us)
+  dist_raw = dist_prev = 0.0; // raw distance output from USS (unit: mm)
+  scale = 0.001 * 0.5 * SND_VEL;
+
+// initialize serial port
+  Serial.begin(57600);
+
+// initialize last sampling time
+  last_sampling_time = 0;
+
 }
 
+ 
+
 void loop() {
-  float distance;
-  float before_distance;
-  if (millis() < (last_sampling_time + INTERVAL))
-    return;
+// wait until next sampling time. 
+// millis() returns the number of milliseconds since the program started. Will overflow after 50 days.
+  if(millis() < last_sampling_time + INTERVAL) return;
 
-  distance = USS_measure(PIN_TRIG, PIN_ECHO); // read distance
-  if (distance <= _DIST_MIN){
-    distance = _DIST_MIN - 10.0;  
-    analogWrite(PIN_LED, 255);
-  }
-  else if(distance >= _DIST_MAX){
-    distance = _DIST_MAX + 10.0;  
-    analogWrite(PIN_LED, 255);
-  }
-  else{
-    int led = 0;
-    if(distance == 200){
-      led = 0;
-    }
-     else{
-      led = int(abs(200-distance) * 2.56);
-     }
-     analogWrite(PIN_LED, led);
-    }
+// get a distance reading from the USS
+  dist_raw = USS_measure(PIN_TRIG,PIN_ECHO);
+  float alpha = 0.3;
+  dist_ema = alpha*dist_raw + (1-alpha)*dist_ema;
 
+// output the read value to the serial port
+  Serial.print("Min:100,raw:");
+  Serial.print(dist_raw);
+  Serial.print(",ema:");
+  Serial.print(dist_ema);
+  Serial.print(",servo:");
+  Serial.print(myservo.read());
+  Serial.println(",Max:400");
 
-  // output the distance to the serial port
-  Serial.print("Min:");        Serial.print(_DIST_MIN);
-  Serial.print(",distance:");  Serial.print(distance);
-  Serial.print(",Max:");       Serial.print(_DIST_MAX);
-  Serial.println("");
-  
-  // do something here
-  //delay(50); // Assume that it takes 50ms to do something.
-  
-  // update last sampling time
-  last_sampling_time += INTERVAL;
-  before_distance = distance;
+// adjust servo position according to the USS read value
+
+   // add your code here!
+  if(dist_ema <= 180.0) {
+     myservo.writeMicroseconds(_DUTY_MIN);
+     analogWrite(PIN_LED, 255);
+  }
+  else if(dist_ema > 180.0 && dist_ema < 360.0){
+    double i = (dist_ema - 180)*10.25;
+    double tmp = i + 553;
+    myservo.writeMicroseconds(tmp);
+    analogWrite(PIN_LED, 0);
+  }
+
+  else {
+    myservo.writeMicroseconds(_DUTY_MAX);
+    analogWrite(PIN_LED, 255);
+  }
+
+// update last sampling time
+  last_sampling_time += INTERVAL;
 }
 
 // get a distance reading from USS. return value is in millimeter.
 float USS_measure(int TRIG, int ECHO)
 {
-  digitalWrite(TRIG, HIGH);
-  delayMicroseconds(PULSE_DURATION);
-  digitalWrite(TRIG, LOW);
-  
-  return pulseIn(ECHO, HIGH, TIMEOUT) * SCALE; // unit: mm
+  float reading;
+
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+
+  reading = pulseIn(ECHO, HIGH, timeout) * scale; // unit: mm
+
+  if(reading < dist_min || reading > dist_max) reading = 0.0; // return 0 when out of range.
+  if(reading == 0.0) reading = dist_prev;
+  else dist_prev = reading;
+
+  return reading;
+}
+
+#include <Servo.h>
+
+// Arduino pin assignment
+#define PIN_LED 9
+#define PIN_SERVO 10
+#define PIN_TRIG 12
+#define PIN_ECHO 13
+
+// configurable parameters
+#define SND_VEL 346.0 // sound velocity at 24 celsius degree (unit: m/s)
+#define INTERVAL 25 // sampling interval (unit: ms)
+#define _DIST_MIN 100 // minimum distance to be measured (unit: mm)
+#define _DIST_MAX 400 // maximum distance to be measured (unit: mm)
+#define _DIST_ALPHA 0.3 // EMA weight of new sample (range: 0 to 1). Setting this value to 1 effectively disables EMA filter.
+#define _DUTY_MIN 553 // servo full clockwise position (0 degree)
+#define _DUTY_NEU 1476 // servo neutral position (90 degree)
+#define _DUTY_MAX 2399 // servo full counterclockwise position (180 degree)
+
+// global variables
+float timeout; // unit: us
+float dist_min, dist_max, dist_raw, dist_prev, dist_ema, alpha; // unit: mm
+unsigned long last_sampling_time; // unit: ms
+float scale; // used for pulse duration to distance conversion
+
+Servo myservo;
+
+void setup() {
+// initialize GPIO pins
+  pinMode(PIN_LED,OUTPUT);
+  pinMode(PIN_TRIG,OUTPUT);
+  digitalWrite(PIN_TRIG, LOW); 
+  pinMode(PIN_ECHO,INPUT);
+
+  myservo.attach(PIN_SERVO); 
+  myservo.writeMicroseconds(_DUTY_NEU);
+
+// initialize USS related variables
+  dist_min = _DIST_MIN; 
+  dist_max = _DIST_MAX;
+  alpha = _DIST_ALPHA;
+  timeout = (INTERVAL / 2) * 1000.0; // precalculate pulseIn() timeout value. (unit: us)
+  dist_raw = dist_prev = 0.0; // raw distance output from USS (unit: mm)
+  scale = 0.001 * 0.5 * SND_VEL;
+
+// initialize serial port
+  Serial.begin(57600);
+
+// initialize last sampling time
+  last_sampling_time = 0;
+}
+
+void loop() {
+// wait until next sampling time. 
+// millis() returns the number of milliseconds since the program started. Will overflow after 50 days.
+  if(millis() < last_sampling_time + INTERVAL) return;
+
+// get a distance reading from the USS
+  dist_raw = USS_measure(PIN_TRIG,PIN_ECHO);
+
+  float alpha = 0.3;
+
+  dist_ema = alpha*dist_raw + (1-alpha)*dist_ema;
+
+// output the read value to the serial port
+  Serial.print("Min:100,raw:");
+  Serial.print(dist_raw);
+  Serial.print(",ema:");
+  Serial.print(dist_ema);
+  Serial.print(",servo:");
+  Serial.print(myservo.read());
+  Serial.println(",Max:400");
+
+// adjust servo position according to the USS read value
+  // add your code here!
+  if(dist_ema <= 180.0) {
+     myservo.writeMicroseconds(_DUTY_MIN);
+     analogWrite(PIN_LED, 255);
+  } else if(dist_ema > 180.0 && dist_ema < 360.0){
+    double i = (dist_ema - 180)*10.25;
+    double tmp = i + 553;
+
+    myservo.writeMicroseconds(tmp);
+    analogWrite(PIN_LED, 0);
+  } else {
+    myservo.writeMicroseconds(_DUTY_MAX);
+    analogWrite(PIN_LED, 255);
+  }
+
+// update last sampling time
+  last_sampling_time += INTERVAL;
+}
+
+// get a distance reading from USS. return value is in millimeter.
+float USS_measure(int TRIG, int ECHO)
+{
+  float reading;
+
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+
+  reading = pulseIn(ECHO, HIGH, timeout) * scale; // unit: mm
+
+  if(reading < dist_min || reading > dist_max) reading = 0.0; // return 0 when out of range.
+  if(reading == 0.0) reading = dist_prev;
+  else dist_prev = reading;
+  return reading;
 }
